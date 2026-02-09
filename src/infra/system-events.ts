@@ -13,6 +13,7 @@ type SessionQueue = {
 };
 
 const queues = new Map<string, SessionQueue>();
+const listeners = new Set<(sessionKey: string, text: string) => void>();
 
 type SystemEventOptions = {
   sessionKey: string;
@@ -74,6 +75,13 @@ export function enqueueSystemEvent(text: string, options: SystemEventOptions) {
   if (entry.queue.length > MAX_EVENTS) {
     entry.queue.shift();
   }
+  for (const listener of listeners) {
+    try {
+      listener(key, cleaned);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 export function drainSystemEventEntries(sessionKey: string): SystemEvent[] {
@@ -106,4 +114,10 @@ export function hasSystemEvents(sessionKey: string) {
 
 export function resetSystemEventsForTest() {
   queues.clear();
+  listeners.clear();
+}
+
+export function onSystemEvent(listener: (sessionKey: string, text: string) => void) {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
 }

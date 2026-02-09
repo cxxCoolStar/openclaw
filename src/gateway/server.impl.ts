@@ -38,8 +38,11 @@ import {
   refreshRemoteBinsForConnectedNodes,
   setSkillsRemoteRegistry,
 } from "../infra/skills-remote.js";
+import { initTwoFactorAuth } from "../security/two-factor-auth.js";
 import { scheduleGatewayUpdateCheck } from "../infra/update-startup.js";
 import { startDiagnosticHeartbeat, stopDiagnosticHeartbeat } from "../logging/diagnostic.js";
+import { onSystemEvent } from "../infra/system-events.js";
+import { deliverOutboundPayloads } from "../infra/outbound/deliver.js";
 import { createSubsystemLogger, runtimeForLogger } from "../logging/subsystem.js";
 import { runOnboardingWizard } from "../wizard/onboarding.js";
 import { startGatewayConfigReloader } from "./config-reload.js";
@@ -57,12 +60,14 @@ import { coreGatewayHandlers } from "./server-methods.js";
 import { createExecApprovalHandlers } from "./server-methods/exec-approval.js";
 import { safeParseJson } from "./server-methods/nodes.helpers.js";
 import { hasConnectedMobileNode } from "./server-mobile-nodes.js";
+import { createTwoFactorAuthHandlers } from "./server-methods/two-factor-auth.js";
 import { loadGatewayModelCatalog } from "./server-model-catalog.js";
 import { createNodeSubscriptionManager } from "./server-node-subscriptions.js";
 import { loadGatewayPlugins } from "./server-plugins.js";
 import { createGatewayReloadHandlers } from "./server-reload-handlers.js";
 import { resolveGatewayRuntimeConfig } from "./server-runtime-config.js";
 import { createGatewayRuntimeState } from "./server-runtime-state.js";
+import { parseAgentSessionKey } from "../routing/session-key.js";
 import { resolveSessionKeyForRun } from "./server-session-key.js";
 import { logGatewayStartup } from "./server-startup-log.js";
 import { startGatewaySidecars } from "./server-startup.js";
@@ -372,6 +377,45 @@ export async function startGatewayServer(
   const hasMobileNodeConnected = () => hasConnectedMobileNode(nodeRegistry);
   applyGatewayLaneConcurrency(cfgAtStart);
 
+  onSystemEvent((sessionKey, text) => {
+    // 1. WebSocket push for Control UI (Deltas/Streaming)
+    nodeSendToSession(sessionKey, "chat", {
+      state: "delta",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: `\n${text}\n` }],
+        timestamp: Date.now(),
+      },
+    });
+
+    // 2. Outbound delivery for Channels (Discord/WhatsApp etc)
+    const parsed = parseAgentSessionKey(sessionKey);
+    if (parsed) {
+      const parts = parsed.rest.split(":");
+      // Format: channel:accountId:peerKind:peerId
+      // e.g. discord:default:channel:1234567890
+      if (parts.length >= 4) {
+        const channel = parts[0] as any;
+        const accountId = parts[1];
+        const peerKind = parts[2];
+        const peerId = parts.slice(3).join(":");
+        if (channel && channel !== "unknown" && peerId) {
+          const to = `${peerKind}:${peerId}`;
+          const cfg = loadConfig();
+          deliverOutboundPayloads({
+            cfg,
+            channel,
+            accountId,
+            to,
+            payloads: [{ text: `\n${text}\n` }],
+          }).catch((err) => {
+            log.error(`Failed to deliver 2FA system event to ${channel}:${to}: ${String(err)}`);
+          });
+        }
+      }
+    }
+  });
+
   let cronState = buildGatewayCronService({
     cfg: cfgAtStart,
     deps,
@@ -458,6 +502,25 @@ export async function startGatewayServer(
   });
 
   let heartbeatRunner = startHeartbeatRunner({ cfg: cfgAtStart });
+  
+  if (cfgAtStart.security?.twoFactor?.enabled) {
+    initTwoFactorAuth({
+      enabled: true,
+      timeoutSeconds: cfgAtStart.security.twoFactor.timeoutSeconds ?? 300,
+      authBaseUrl:
+        cfgAtStart.security.twoFactor.authBaseUrl ??
+        `http://${bindHost || "127.0.0.1"}:${port}${controlUiBasePath ?? ""}`,
+      codeLength: cfgAtStart.security.twoFactor.codeLength ?? 6,
+      mock:
+        cfgAtStart.security.twoFactor.mock?.enabled
+          ? {
+              enabled: true,
+              authUrl: cfgAtStart.security.twoFactor.mock?.authUrl,
+              code: cfgAtStart.security.twoFactor.mock?.code,
+            }
+          : undefined,
+    });
+  }
 
   void cron.start().catch((err) => logCron.error(`failed to start: ${String(err)}`));
 
@@ -485,6 +548,7 @@ export async function startGatewayServer(
     extraHandlers: {
       ...pluginRegistry.gatewayHandlers,
       ...execApprovalHandlers,
+      ...(cfgAtStart.security?.twoFactor?.enabled ? createTwoFactorAuthHandlers() : {}),
     },
     broadcast,
     context: {

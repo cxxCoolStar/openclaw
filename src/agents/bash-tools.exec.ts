@@ -19,6 +19,7 @@ import {
   resolveExecApprovals,
   resolveExecApprovalsFromFile,
 } from "../infra/exec-approvals.js";
+import { loadConfig } from "../config/config.js";
 import { requestHeartbeatNow } from "../infra/heartbeat-wake.js";
 import { buildNodeShellCommand } from "../infra/node-shell.js";
 import {
@@ -55,6 +56,15 @@ import { buildCursorPositionResponse, stripDsrRequests } from "./pty-dsr.js";
 import { getShellConfig, sanitizeBinaryOutput } from "./shell-utils.js";
 import { callGatewayTool } from "./tools/gateway.js";
 import { listNodes, resolveNodeIdFromList } from "./tools/nodes-utils.js";
+import {
+  detectHighRiskCommand,
+  type HighRiskDetectorConfig,
+} from "../security/high-risk-detector.js";
+import {
+  getTwoFactorAuthManager,
+  type TwoFactorAuthManager,
+} from "../security/two-factor-auth.js";
+import { formatTwoFactorAuthMessage } from "../gateway/server-methods/two-factor-auth.js";
 
 // Security: Blocklist of environment variables that could alter execution flow
 // or inject code when running on non-sandboxed hosts (Gateway/Node).
@@ -849,6 +859,19 @@ export function createExecTool(
         throw new Error("Provide a command to start.");
       }
 
+      if (defaults?.sessionKey) {
+        (globalThis as any).__LAST_AGENT_SESSION_KEY__ = defaults.sessionKey;
+      }
+
+      // === 2FA High-Risk Command Detection Prefilled ===
+      // Pre-check 2FA early to set a flag, but we'll enforce it after security resolution to bypass allowlist.
+      let twoFactorVerified = false;
+      const twoFactorManager = getTwoFactorAuthManager();
+      const is2faEnabled = twoFactorManager?.isEnabled();
+
+      // Debug: Log extremely early to see if execute is even called.
+      logInfo(`[2FA-DEBUG] execute called command="${params.command}" 2fa_manager_enabled=${is2faEnabled}`);
+
       const maxOutput = DEFAULT_MAX_OUTPUT;
       const pendingMaxOutput = DEFAULT_PENDING_MAX_OUTPUT;
       const warnings: string[] = [];
@@ -937,6 +960,57 @@ export function createExecTool(
       const configuredSecurity = defaults?.security ?? (host === "sandbox" ? "deny" : "allowlist");
       const requestedSecurity = normalizeExecSecurity(params.security);
       let security = minSecurity(configuredSecurity, requestedSecurity ?? configuredSecurity);
+
+      // === 2FA Enforcement ===
+      // We enforce here so we can override 'security' to 'full' and bypass allowlist.
+      if (is2faEnabled && twoFactorManager) {
+        const config = loadConfig();
+        const highRiskEnabled = config.security?.twoFactor?.highRiskCommands?.enabled ?? true;
+        const highRiskConfig: HighRiskDetectorConfig = {
+          enabled: highRiskEnabled,
+          disabledPatternIds: config.security?.twoFactor?.highRiskCommands?.disabledPatternIds,
+          customPatterns: config.security?.twoFactor?.highRiskCommands?.customPatterns?.map((p) => ({
+            ...p,
+            pattern: new RegExp(p.pattern, "i"),
+          })),
+        };
+
+        const isHighRiskResult = detectHighRiskCommand(params.command, highRiskConfig);
+        logInfo(`[2FA-DEBUG] high-risk check: cmd="${params.command}" result=${isHighRiskResult.isHighRisk}`);
+        
+        if (isHighRiskResult.isHighRisk) {
+          const authRequest = twoFactorManager.create({
+            command: params.command,
+            sessionKey: defaults?.sessionKey,
+            agentId,
+            channelId: defaults?.messageProvider,
+          });
+          const authUrl = twoFactorManager.getAuthUrl(authRequest.id);
+          const authMessage = formatTwoFactorAuthMessage(authRequest, authUrl);
+
+          logInfo(`[2FA-DEBUG] triggering 2fa for cmd="${params.command}"`);
+          // Emit notification to user
+        if (notifySessionKey) {
+            enqueueSystemEvent(authMessage, {
+            sessionKey: notifySessionKey,
+              contextKey: `2fa:${authRequest.id}`,
+            });
+          }
+
+          // Wait for verification
+          const verified = await twoFactorManager.waitForVerification(authRequest);
+          if (!verified) {
+            const reason = authRequest.status === "cancelled" ? "用户取消" : "验证超时";
+            throw new Error(
+              `二次认证失败 (${reason}): 高危命令 "${truncateMiddle(params.command, 60)}" 执行被拒绝`,
+            );
+          }
+          logInfo(`[2FA-DEBUG] 2FA verified successfully!`);
+          security = "full"; // BYPASS EVERYTHING
+          twoFactorVerified = true;
+        }
+      }
+
       if (elevatedRequested && elevatedMode === "full") {
         security = "full";
       }
@@ -1628,3 +1702,58 @@ export function createExecTool(
 }
 
 export const execTool = createExecTool();
+
+/**
+ * Special tool to force a 2FA verification flow for debugging purposes.
+ * This tool is extremely simple and has no parameters, making it easy for the model to call.
+ */
+export function createTwoFactorVerifyTool(): AgentTool<any, any> {
+  return {
+    name: "2fa_verify",
+    label: "2FA Verify",
+    description: "Force trigger a 2FA verification request to the user. Use this to test if 2FA delivery is working.",
+    parameters: Type.Object({}),
+    execute: async (_toolCallId, _args, _signal) => {
+      const twoFactorManager = getTwoFactorAuthManager();
+      if (!twoFactorManager?.isEnabled()) {
+        throw new Error("2FA is not enabled in the gateway configuration.");
+      }
+
+      const config = loadConfig();
+      const authRequest = twoFactorManager.create({
+        command: "manual-2fa-verification-test",
+        sessionKey: (globalThis as any).__LAST_AGENT_SESSION_KEY__, // Try to recover last session key
+      });
+
+      const authUrl = twoFactorManager.getAuthUrl(authRequest.id);
+      const authMessage = formatTwoFactorAuthMessage(authRequest, authUrl);
+
+      // Emit notification to user
+      const sessionKey = (globalThis as any).__LAST_AGENT_SESSION_KEY__;
+      if (sessionKey) {
+        enqueueSystemEvent(authMessage, {
+          sessionKey: sessionKey,
+          contextKey: `2fa:${authRequest.id}`,
+        });
+      }
+
+      // Wait for verification
+      const verified = await twoFactorManager.waitForVerification(authRequest);
+      if (!verified) {
+        throw new Error("2FA verification failed or timed out.");
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: "2FA Verification Successful! The 2FA delivery and response flow is working correctly.",
+          },
+        ],
+        details: { status: "completed" },
+      };
+    },
+  };
+}
+
+export const twoFactorVerifyTool = createTwoFactorVerifyTool();

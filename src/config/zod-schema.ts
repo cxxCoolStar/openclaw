@@ -222,7 +222,7 @@ export const OpenClawSchema = z
                 color: HexColorSchema,
               })
               .strict()
-              .refine((value) => value.cdpPort || value.cdpUrl, {
+              .refine((value: any) => value.cdpPort || value.cdpUrl, {
                 message: "Profile must set cdpPort or cdpUrl",
               }),
           )
@@ -594,14 +594,55 @@ export const OpenClawSchema = z
       })
       .strict()
       .optional(),
+    security: z
+      .object({
+        twoFactor: z
+          .object({
+            enabled: z.boolean().optional(),
+            timeoutSeconds: z.number().int().positive().optional(),
+            authBaseUrl: z.string().optional(),
+            codeLength: z.number().int().min(4).max(10).optional(),
+            mock: z
+              .object({
+                enabled: z.boolean().optional(),
+                authUrl: z.string().optional(),
+                code: z.string().optional(),
+              })
+              .strict()
+              .optional(),
+            highRiskCommands: z
+              .object({
+                enabled: z.boolean().optional(),
+                disabledPatternIds: z.array(z.string()).optional(),
+                customPatterns: z
+                  .array(
+                    z
+                      .object({
+                        id: z.string(),
+                        pattern: z.string(),
+                        description: z.string(),
+                        severity: z.enum(["critical", "high", "medium"]),
+                      })
+                      .strict(),
+                  )
+                  .optional(),
+              })
+              .strict()
+              .optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
-  .superRefine((cfg, ctx) => {
+  .superRefine((cfg: any, ctx: z.RefinementCtx) => {
     const agents = cfg.agents?.list ?? [];
     if (agents.length === 0) {
       return;
     }
-    const agentIds = new Set(agents.map((agent) => agent.id));
+    const agentIds = new Set(agents.map((agent: any) => agent.id));
 
     const broadcast = cfg.broadcast;
     if (!broadcast) {

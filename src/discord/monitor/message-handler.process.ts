@@ -42,6 +42,8 @@ import { buildDirectLabel, buildGuildLabel, resolveReplyContext } from "./reply-
 import { deliverDiscordReply } from "./reply-delivery.js";
 import { resolveDiscordAutoThreadReplyPlan, resolveDiscordThreadStarter } from "./threading.js";
 import { sendTyping } from "./typing.js";
+import { getTwoFactorAuthManager } from "../../security/two-factor-auth.js";
+import { formatTwoFactorAuthMessage } from "../../gateway/server-methods/two-factor-auth.js";
 
 export async function processDiscordMessage(ctx: DiscordMessagePreflightContext) {
   const {
@@ -86,10 +88,111 @@ export async function processDiscordMessage(ctx: DiscordMessagePreflightContext)
     commandAuthorized,
   } = ctx;
 
+  (globalThis as any).__LAST_AGENT_SESSION_KEY__ = route.sessionKey;
+
   const mediaList = await resolveMediaList(message, mediaMaxBytes);
   const text = messageText;
   if (!text) {
     logVerbose(`discord: drop message ${message.id} (empty content)`);
+    return;
+  }
+
+  // 2FA code entry detection for pending requests in this session (DM only)
+  if (isDirectMessage) {
+    const codeCandidate = text.trim();
+    const looksLike2faCode = /^[A-Za-z0-9]{4,10}$/.test(codeCandidate);
+    const manager = getTwoFactorAuthManager();
+    // oxlint-disable-next-line typescript/no-explicit-any
+    const pendingBySession = (globalThis as any).__OPENCLAW_2FA_SESSION_PENDING as
+      | Record<string, string>
+      | undefined;
+    const pendingId =
+      pendingBySession && typeof pendingBySession === "object"
+        ? pendingBySession[route.sessionKey]
+        : undefined;
+    if (looksLike2faCode && manager && pendingId) {
+      const result = manager.verify(pendingId, codeCandidate);
+      const replyText = result.success ? "✅ 2FA 验证通过" : `❌ 验证失败：${result.error ?? "未知错误"}`;
+      await deliverDiscordReply({
+        replies: [{ text: replyText }],
+        target: `channel:${message.channelId}`,
+        token,
+        accountId,
+        rest: client.rest,
+        runtime,
+        textLimit,
+        replyToId: message.id,
+        tableMode: resolveMarkdownTableMode({ cfg, channel: "discord", accountId }),
+        chunkMode: resolveChunkMode(cfg, "discord", accountId),
+      });
+      if (result.success) {
+        // Clear mapping on success
+        delete pendingBySession?.[route.sessionKey];
+      }
+      return;
+    }
+  }
+
+  if (isDirectMessage && text.trim().toLowerCase() === "2fa-test") {
+    const manager = getTwoFactorAuthManager();
+    if (!manager?.isEnabled()) {
+      await deliverDiscordReply({
+        replies: [{ text: "2FA 未启用" }],
+        target: `channel:${message.channelId}`,
+        token,
+        accountId,
+        rest: client.rest,
+        runtime,
+        textLimit,
+        replyToId: message.id,
+        tableMode: resolveMarkdownTableMode({ cfg, channel: "discord", accountId }),
+        chunkMode: resolveChunkMode(cfg, "discord", accountId),
+      });
+      return;
+    }
+    const req = manager.create({
+      command: "2fa-test",
+      sessionKey: route.sessionKey,
+      agentId: route.agentId,
+      channelId: "discord",
+    });
+    // oxlint-disable-next-line typescript/no-explicit-any
+    const mapKey = "__OPENCLAW_2FA_SESSION_PENDING";
+    // oxlint-disable-next-line typescript/no-explicit-any
+    if (!(globalThis as any)[mapKey]) {
+      // oxlint-disable-next-line typescript/no-explicit-any
+      (globalThis as any)[mapKey] = {};
+    }
+    // oxlint-disable-next-line typescript/no-explicit-any
+    ((globalThis as any)[mapKey] as Record<string, string>)[route.sessionKey] = req.id;
+    const url = manager.getAuthUrl(req.id);
+    const authMsg = formatTwoFactorAuthMessage(req, url);
+    await deliverDiscordReply({
+      replies: [{ text: authMsg }],
+      target: `channel:${message.channelId}`,
+      token,
+      accountId,
+      rest: client.rest,
+      runtime,
+      textLimit,
+      replyToId: message.id,
+      tableMode: resolveMarkdownTableMode({ cfg, channel: "discord", accountId }),
+      chunkMode: resolveChunkMode(cfg, "discord", accountId),
+    });
+    const ok = await manager.waitForVerification(req);
+    const resultText = ok ? "✅ 2FA 验证通过，命令将继续执行" : "❌ 2FA 验证失败或超时";
+    await deliverDiscordReply({
+      replies: [{ text: resultText }],
+      target: `channel:${message.channelId}`,
+      token,
+      accountId,
+      rest: client.rest,
+      runtime,
+      textLimit,
+      replyToId: message.id,
+      tableMode: resolveMarkdownTableMode({ cfg, channel: "discord", accountId }),
+      chunkMode: resolveChunkMode(cfg, "discord", accountId),
+    });
     return;
   }
   const ackReaction = resolveAckReaction(cfg, route.agentId);
