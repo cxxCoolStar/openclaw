@@ -4,6 +4,29 @@
 
 本方案旨在为 OpenClaw 添加二次认证功能，当检测到高危操作时，暂停执行并要求用户通过外部链接进行二次认证。认证通过后获取验证码，输入验证码后 OpenClaw 验证通过方可继续执行命令。
 
+## 现状更新（已实现与验证）
+
+- 已实现内置 2FA 管理器（TwoFactorAuthManager），支持超时与验证码校验，并提供单例初始化与获取接口
+  - 文件：`src/security/two-factor-auth.ts`
+  - 支持配置：`enabled`、`timeoutSeconds`、`authBaseUrl`、`codeLength`、`mock.{enabled,authUrl,code}`
+- 已在网关启动时初始化 2FA，并加载配置（含 mock）
+  - 文件：`src/gateway/server.impl.ts`
+  - 行为：当 `security.twoFactor.enabled` 为真时初始化；若 `security.twoFactor.mock.enabled` 为真，则使用 mock 链接与固定验证码
+- 已在命令执行工具中集成高危检测与 2FA 阻断
+  - 文件：`src/agents/bash-tools.exec.ts`
+  - 行为：命中高危命令后，发送 2FA 提示消息并等待验证；验证通过后将 `security` 提升为 `full` 继续执行
+- 已在 Discord 私聊入口增加 2FA 快速测试与验证码捕获
+  - 文件：`src/discord/monitor/message-handler.process.ts`
+  - 行为：私聊输入 `2fa-test` 时主动发送认证消息并等待；私聊输入形如 4–10 位字母数字的验证码时，直接匹配当前会话的待验证请求并即时反馈结果
+- 已扩展配置 Schema 以支持 `security.twoFactor.mock`，并在网关初始化时读取
+  - 文件：`src/config/zod-schema.ts`
+  - 新增键：`security.twoFactor.mock.enabled|authUrl|code`
+- 已提供网关方法用于 2FA 验证/状态查询/取消
+  - 文件：`src/gateway/server-methods/two-factor-auth.ts`
+  - 方法：`2fa.verify`、`2fa.status`、`2fa.cancel`；提示文案包含认证链接与有效期
+
+备注：上述实现已在本地通过 Discord 私聊测试，mock 模式下使用验证码 `123456` 可稳定通过；认证链接建议固定为 `http://127.0.0.1:18789` 以避免 0.0.0.0 的可达性问题。
+
 ## 调研结论
 
 ### 项目能力分析
@@ -66,7 +89,7 @@ sequenceDiagram
 
 ### 模块设计
 
-#### 1. 高危操作检测器 [NEW]
+#### 1. 高危操作检测器 [READY]
 **文件**: `src/security/high-risk-detector.ts`
 
 功能：
@@ -88,7 +111,7 @@ const HIGH_RISK_PATTERNS = [
 
 ---
 
-#### 2. 二次认证管理器 [NEW]
+#### 2. 二次认证管理器 [READY]
 **文件**: `src/security/two-factor-auth.ts`
 
 功能：
@@ -120,7 +143,7 @@ class TwoFactorAuthManager {
 
 ---
 
-#### 3. 外部认证服务接口 [NEW]
+#### 3. 外部认证服务接口 [PLANNED]
 **文件**: `src/security/two-factor-provider.ts`
 
 功能：
@@ -145,53 +168,34 @@ class ExternalTwoFactorProvider implements TwoFactorProvider {
   // 调用配置的外部 HTTP 接口
 }
 
-// Okta 集成
-class OktaTwoFactorProvider implements TwoFactorProvider {
-  async generateAuthUrl(requestId: string, metadata: object): string {
-    // 调用 Okta Authentication API
-    // POST /api/v1/authn
-  }
-  async verifyCode(requestId: string, code: string): Promise<boolean> {
-    // 验证 Okta 返回的 sessionToken
-  }
-}
-
-// Duo Security 集成  
-class DuoTwoFactorProvider implements TwoFactorProvider {
-  async generateAuthUrl(requestId: string, metadata: object): string {
-    // 调用 Duo Auth API
-    // POST /auth/v2/auth
-  }
-  async verifyCode(requestId: string, code: string): Promise<boolean> {
-    // 验证 Duo 返回的 txid
-  }
-}
 ```
 
 ---
 
-#### 4. 配置扩展 [MODIFY]
+#### 4. 配置扩展 [UPDATED]
 **文件**: `src/config/config.ts`
 
 新增配置项：
 ```yaml
 security:
-  twoFactorAuth:
+  twoFactor:
     enabled: true
-    provider: "gateway"  # "gateway" | "external"
-    externalUrl: "https://your-2fa-service.com/api"
-    externalToken: "your-api-token"
     timeoutSeconds: 300
-    highRiskPatterns:
-      - "rm -rf"
-      - "sudo"
-      - "drop database"
-    customPatterns: []
+    authBaseUrl: "http://127.0.0.1:18789"
+    codeLength: 6
+    mock:
+      enabled: true
+      authUrl: "https://mock-2fa.example/verify?from=openclaw"
+      code: "123456"
+    highRiskCommands:
+      enabled: true
+      disabledPatternIds: []
+      customPatterns: []
 ```
 
 ---
 
-#### 5. 命令执行集成 [MODIFY]
+#### 5. 命令执行集成 [READY]
 **文件**: `src/agents/bash-tools.exec.ts`
 
 修改 `createExecTool()` 函数，在命令执行前添加二次认证检查：
@@ -223,7 +227,7 @@ if (isHighRiskCommand(command) && twoFactorAuthEnabled) {
 
 ---
 
-#### 6. Gateway 认证端点 [NEW]
+#### 6. Gateway 认证端点 [READY]
 **文件**: `src/gateway/server-methods/two-factor-auth.ts`
 
 新增 Gateway API 端点：
@@ -250,7 +254,7 @@ interface TwoFactorVerifyRequest {
 
 ---
 
-#### 7. 消息通道集成 [MODIFY]
+#### 7. 消息通道集成 [UPDATED]
 **文件**: 各平台 handler（Discord/Telegram/Slack 等）
 
 在检测到高危操作时，通过对应平台发送认证链接消息：
@@ -275,21 +279,20 @@ const authMessage = {
 
 | 操作 | 文件路径 | 说明 |
 |------|---------|------|
-| [NEW] | `src/security/high-risk-detector.ts` | 高危操作检测器 |
-| [NEW] | `src/security/two-factor-auth.ts` | 二次认证管理器 |
-| [NEW] | `src/security/two-factor-provider.ts` | 认证服务提供商接口 |
-| [NEW] | `src/gateway/server-methods/two-factor-auth.ts` | Gateway 2FA API |
-| [MODIFY] | `src/config/config.ts` | 添加 2FA 配置项 |
-| [MODIFY] | `src/agents/bash-tools.exec.ts` | 集成 2FA 检查 |
-| [MODIFY] | `src/discord/handler.ts` | Discord 认证消息 |
-| [MODIFY] | `src/telegram/handler.ts` | Telegram 认证消息 |
-| [MODIFY] | `src/slack/handler.ts` | Slack 认证消息 |
-| [NEW] | `src/security/two-factor-auth.test.ts` | 单元测试 |
-| [NEW] | `src/security/trusted-devices.ts` | 记住设备管理器 |
+| [READY] | `src/security/high-risk-detector.ts` | 高危操作检测器 |
+| [READY] | `src/security/two-factor-auth.ts` | 二次认证管理器（含 mock 支持） |
+| [PLANNED] | `src/security/two-factor-provider.ts` | 认证服务提供商接口（外部 2FA） |
+| [READY] | `src/gateway/server-methods/two-factor-auth.ts` | Gateway 2FA API |
+| [UPDATED] | `src/config/zod-schema.ts` | 扩展 `security.twoFactor.mock` |
+| [READY] | `src/gateway/server.impl.ts` | 初始化 2FA（含 mock） |
+| [READY] | `src/agents/bash-tools.exec.ts` | 集成 2FA 检查与执行提升 |
+| [UPDATED] | `src/discord/monitor/message-handler.process.ts` | 私聊 2FA 测试与验证码捕获 |
+| [PLANNED] | `src/security/two-factor-auth.test.ts` | 单元测试 |
+| [PLANNED] | `src/security/trusted-devices.ts` | 记住设备管理器 |
 
 ---
 
-#### 8. 记住设备功能 [NEW]
+#### 8. 记住设备功能 [PLANNED]
 **文件**: `src/security/trusted-devices.ts`
 
 功能：
@@ -379,7 +382,7 @@ const authMessage = {
 
 ### 单元测试
 
-1. **高危操作检测测试**
+1. **高危操作检测测试** [PLANNED]
    ```bash
    pnpm test -- --grep "high-risk-detector"
    ```
@@ -387,7 +390,7 @@ const authMessage = {
    - 测试安全命令不触发检测
    - 测试自定义规则配置
 
-2. **二次认证管理器测试**
+2. **二次认证管理器测试** [PLANNED]
    ```bash
    pnpm test -- --grep "two-factor-auth"
    ```
@@ -398,7 +401,7 @@ const authMessage = {
 
 ### 集成测试
 
-1. **Gateway API 测试**
+1. **Gateway API 测试** [PLANNED]
    ```bash
    pnpm test:e2e -- --grep "two-factor"
    ```
@@ -408,8 +411,13 @@ const authMessage = {
 
 ### 手动测试
 
-1. **配置启用 2FA**
-   - 在 `config.yaml` 中启用 `security.twoFactorAuth.enabled: true`
+1. **配置启用 2FA（已支持）**
+   - 在 `openclaw.json` 中启用：
+     - `security.twoFactor.enabled: true`
+     - `security.twoFactor.authBaseUrl: "http://127.0.0.1:18789"`
+     - `security.twoFactor.mock.enabled: true`
+     - `security.twoFactor.mock.authUrl: "https://mock-2fa.example/verify?from=openclaw"`
+     - `security.twoFactor.mock.code: "123456"`
 
 2. **触发高危操作**
    - 通过 Discord/Telegram 发送 `rm -rf /tmp/test` 命令
@@ -418,7 +426,7 @@ const authMessage = {
 3. **完成认证流程**
    - 点击认证链接
    - 获取验证码
-   - 输入验证码
+   - 输入验证码（mock 模式为 `123456`）
    - 确认命令继续执行
 
 4. **测试超时场景**
@@ -457,10 +465,22 @@ const authMessage = {
 ## 下一步
 
 > [!IMPORTANT]
-> 请确认以上实现方案是否符合您的需求。确认后我将开始按照文件变更清单进行代码实现。
+> 请基于当前“已实现/规划”状态确认是否继续推进剩余模块（外部提供商、记住设备、测试套件）。
 
 **已确认的设计选项**：
 - ✅ 支持外部 2FA 服务（Okta、Duo Security）  
 - ✅ 高危操作规则可配置
 - ✅ 验证码有效期 5 分钟
 - ✅ 记住设备功能（默认 30 天，最长 90 天）
+
+---
+
+## 运行注意与故障排查（新增）
+
+- Discord 启动失败（Failed to resolve Discord application id）
+  - 原因：使用 Bot Token 调用 `/oauth2/applications/@me` 未返回应用信息（令牌错误/撤销/超时）
+  - 修复：更新为最新 Bot Token；必要时延长解析超时或在失败时降级为监听模式
+- 列目录命令默认被允许列表拒绝
+  - 建议：为 Windows 添加 `tools.exec.safeBins: ["powershell","pwsh"]` 放行无路径参数用法；或将 `powershell.exe/pwsh.exe/cmd.exe` 加入 allowlist
+- 认证链接主机
+  - 建议：固定为 `http://127.0.0.1:18789`，避免 0.0.0.0 浏览器不可达

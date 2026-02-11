@@ -14,7 +14,16 @@ import {
   setSseHeaders,
   writeDone,
 } from "./http-common.js";
-import { getBearerToken, resolveAgentIdForRequest, resolveSessionKey } from "./http-utils.js";
+import {
+  getBearerToken,
+  getHeader,
+  resolveAgentIdForRequest,
+  resolveSessionKey,
+} from "./http-utils.js";
+import { getTwoFactorAuthManager } from "../security/two-factor-auth.js";
+import { formatTwoFactorAuthMessage } from "./server-methods/two-factor-auth.js";
+import { logVerbose } from "../globals.js";
+import { logInfo } from "../logger.js";
 
 type OpenAiHttpOptions = {
   auth: ResolvedGatewayAuth;
@@ -220,6 +229,178 @@ export async function handleOpenAiHttpRequest(
 
   const runId = `chatcmpl_${randomUUID()}`;
   const deps = createDefaultDeps();
+  const channelHint =
+    getHeader(req, "x-openclaw-message-channel")?.trim().toLowerCase() ?? "";
+  const sessionKeyHeader =
+    getHeader(req, "x-openclaw-session-key")?.trim().toLowerCase() ?? "";
+  const isDingtalk =
+    channelHint.includes("dingtalk") ||
+    sessionKeyHeader.includes("dingtalk") ||
+    sessionKey.toLowerCase().includes(":dingtalk:") ||
+    sessionKey.toLowerCase().includes("dingtalk") ||
+    (user?.toLowerCase().includes("dingtalk") ?? false);
+  const manager = getTwoFactorAuthManager();
+  const mapKey = "__OPENCLAW_2FA_SESSION_PENDING";
+  const globalStore = globalThis as unknown as Record<string, unknown>;
+  const pendingBySession =
+    globalStore[mapKey] && typeof globalStore[mapKey] === "object"
+      ? (globalStore[mapKey] as Record<string, string>)
+      : undefined;
+  const text = prompt.message.trim();
+  const normalized = text.toLowerCase();
+  const shouldHandle2faTest = normalized.includes("2fa-test");
+  const shouldTrace =
+    shouldHandle2faTest ||
+    Boolean(channelHint) ||
+    Boolean(sessionKeyHeader) ||
+    Boolean(pendingBySession?.[sessionKey]);
+  if (shouldTrace) {
+    logVerbose(
+      [
+        "openai-http: 2fa trace",
+        `channelHint=${channelHint || "none"}`,
+        `sessionKeyHeader=${sessionKeyHeader || "none"}`,
+        `sessionKey=${sessionKey}`,
+        `user=${user ?? "none"}`,
+        `isDingtalk=${String(isDingtalk)}`,
+        `manager=${manager?.isEnabled() ? "enabled" : manager ? "disabled" : "missing"}`,
+        `text=${text.slice(0, 120)}`,
+      ].join(" "),
+    );
+    if (shouldHandle2faTest) {
+      logInfo(
+        [
+          "openai-http: 2fa-test inbound",
+          `channelHint=${channelHint || "none"}`,
+          `sessionKeyHeader=${sessionKeyHeader || "none"}`,
+          `sessionKey=${sessionKey}`,
+          `user=${user ?? "none"}`,
+          `isDingtalk=${String(isDingtalk)}`,
+          `manager=${manager?.isEnabled() ? "enabled" : manager ? "disabled" : "missing"}`,
+          `text=${text.slice(0, 120)}`,
+        ].join(" "),
+      );
+    }
+  }
+
+  const sendNonStreamResponse = (content: string) => {
+    sendJson(res, 200, {
+      id: runId,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content },
+          finish_reason: "stop",
+        },
+      ],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+  };
+
+  const sendStreamChunks = (contents: string[]) => {
+    setSseHeaders(res);
+    let wroteRole = false;
+    for (const content of contents) {
+      if (!content) {
+        continue;
+      }
+      if (!wroteRole) {
+        wroteRole = true;
+        writeSse(res, {
+          id: runId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, delta: { role: "assistant" } }],
+        });
+      }
+      writeSse(res, {
+        id: runId,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [
+          {
+            index: 0,
+            delta: { content },
+            finish_reason: null,
+          },
+        ],
+      });
+    }
+    writeDone(res);
+    res.end();
+  };
+
+  if ((isDingtalk || shouldHandle2faTest) && manager?.isEnabled()) {
+    const pendingId = pendingBySession?.[sessionKey];
+    const codeMatch = pendingId ? text.match(/\b[A-Za-z0-9]{4,10}\b/) : null;
+    if (pendingId && codeMatch) {
+      const result = manager.verify(pendingId, codeMatch[0]);
+      const replyText = result.success ? "✅ 2FA 验证通过" : `❌ 验证失败：${result.error ?? "未知错误"}`;
+      if (result.success && pendingBySession) {
+        delete pendingBySession[sessionKey];
+      }
+      if (stream) {
+        sendStreamChunks([replyText]);
+      } else {
+        sendNonStreamResponse(replyText);
+      }
+      return true;
+    }
+
+    if (shouldHandle2faTest) {
+      const reqItem = manager.create({
+        command: "2fa-test",
+        sessionKey,
+        agentId,
+        channelId: "dingtalk",
+        userId: user ?? undefined,
+      });
+      if (!globalStore[mapKey] || typeof globalStore[mapKey] !== "object") {
+        globalStore[mapKey] = {};
+      }
+      (globalStore[mapKey] as Record<string, string>)[sessionKey] = reqItem.id;
+      const url = manager.getAuthUrl(reqItem.id);
+      const authMsg = formatTwoFactorAuthMessage(reqItem, url);
+      void manager.waitForVerification(reqItem);
+      if (stream) {
+        setSseHeaders(res);
+        writeSse(res, {
+          id: runId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, delta: { role: "assistant" } }],
+        });
+        writeSse(res, {
+          id: runId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, delta: { content: authMsg }, finish_reason: null }],
+        });
+        writeDone(res);
+        res.end();
+        return true;
+      } else {
+        sendNonStreamResponse(authMsg);
+        return true;
+      }
+    }
+  }
+  if (shouldHandle2faTest && !manager?.isEnabled()) {
+    const replyText = "2FA 未启用";
+    if (stream) {
+      sendStreamChunks([replyText]);
+    } else {
+      sendNonStreamResponse(replyText);
+    }
+    return true;
+  }
 
   if (!stream) {
     try {
